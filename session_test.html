@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session Scoping Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .test-section { margin: 20px 0; padding: 15px; border: 1px solid #ccc; }
+        .success { background-color: #d4edda; border-color: #c3e6cb; }
+        .error { background-color: #f8d7da; border-color: #f5c6cb; }
+        button { padding: 10px 15px; margin: 5px; }
+        pre { background: #f4f4f4; padding: 10px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>Session Scoping Test</h1>
+
+    <div class="test-section">
+        <h2>1. Check Session ID</h2>
+        <p><strong>Storage Mode:</strong> <span id="storage-mode">Checking...</span></p>
+        <button onclick="checkSessionId()">Check Current Session ID</button>
+        <button onclick="clearSession()">Clear Session (Generate New)</button>
+        <button onclick="switchToSessionStorage()">Switch to Per-Tab Mode</button>
+        <button onclick="switchToLocalStorage()">Switch to Per-Window Mode</button>
+        <div id="session-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>2. Test API Calls</h2>
+        <button onclick="testJobsApi()">Test /jobs API</button>
+        <button onclick="testConvertApi()">Test /convert-file API</button>
+        <div id="api-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>3. Instructions</h2>
+        <ol>
+            <li>Open browser developer tools (F12)</li>
+            <li>Go to Network tab</li>
+            <li>Click "Test /jobs API" above</li>
+            <li>Look for the request and check if it has <code>session_id</code> parameter</li>
+            <li>Open this page in a new browser/incognito window</li>
+            <li>Compare session_ids - they should be different!</li>
+        </ol>
+    </div>
+
+    <script>
+        function updateStorageMode() {
+            const isSessionStorage = typeof USE_SESSION_STORAGE !== 'undefined' ? USE_SESSION_STORAGE :
+                                   localStorage.getItem('filewizard_use_session_storage') === 'true';
+            const mode = isSessionStorage ? 'Per-Tab (sessionStorage)' : 'Per-Window (localStorage)';
+            document.getElementById('storage-mode').textContent = mode;
+        }
+
+        function checkSessionId() {
+            updateStorageMode();
+            try {
+                // This should work if the main app's JS is loaded
+                if (typeof getFileWizardSessionId === 'function') {
+                    const sessionId = getFileWizardSessionId();
+                    document.getElementById('session-result').innerHTML =
+                        `<div class="success">Session ID: <code>${sessionId}</code></div>`;
+                } else {
+                    // Fallback: check all storage types
+                    let results = [];
+
+                    // Check localStorage
+                    try {
+                        const localId = localStorage.getItem('filewizard_session_id');
+                        results.push(`localStorage: ${localId || 'not found'}`);
+                    } catch (e) {
+                        results.push(`localStorage: error - ${e.message}`);
+                    }
+
+                    // Check sessionStorage
+                    try {
+                        const sessionId = sessionStorage.getItem('filewizard_session_id');
+                        results.push(`sessionStorage: ${sessionId || 'not found'}`);
+                    } catch (e) {
+                        results.push(`sessionStorage: error - ${e.message}`);
+                    }
+
+                    // Check cookies
+                    try {
+                        const cookieValue = document.cookie.split('; ').find(row => row.startsWith('filewizard_session_id='));
+                        const cookieId = cookieValue ? cookieValue.split('=')[1] : null;
+                        results.push(`cookies: ${cookieId || 'not found'}`);
+                    } catch (e) {
+                        results.push(`cookies: error - ${e.message}`);
+                    }
+
+                    const hasAnySession = results.some(r => r.includes('localStorage: ') && !r.includes('not found') ||
+                                                          r.includes('sessionStorage: ') && !r.includes('not found') ||
+                                                          r.includes('cookies: ') && !r.includes('not found'));
+
+                    document.getElementById('session-result').innerHTML =
+                        hasAnySession ?
+                        `<div class="success">Session storage check:<br>${results.map(r => `• ${r}`).join('<br>')}</div>` :
+                        `<div class="error">No session ID found in any storage:<br>${results.map(r => `• ${r}`).join('<br>')}</div>`;
+                }
+            } catch (e) {
+                document.getElementById('session-result').innerHTML =
+                    `<div class="error">Error: ${e.message}</div>`;
+            }
+        }
+
+        function switchToSessionStorage() {
+            localStorage.setItem('filewizard_use_session_storage', 'true');
+            // Clear existing session to force regeneration
+            sessionStorage.removeItem('filewizard_session_id');
+            localStorage.removeItem('filewizard_session_id');
+            updateStorageMode();
+            document.getElementById('session-result').innerHTML =
+                `<div class="success">Switched to per-tab mode. Click "Check Current Session ID" to generate new session.</div>`;
+        }
+
+        function switchToLocalStorage() {
+            localStorage.setItem('filewizard_use_session_storage', 'false');
+            // Clear existing session to force regeneration
+            sessionStorage.removeItem('filewizard_session_id');
+            localStorage.removeItem('filewizard_session_id');
+            updateStorageMode();
+            document.getElementById('session-result').innerHTML =
+                `<div class="success">Switched to per-window mode. Click "Check Current Session ID" to generate new session.</div>`;
+        }
+
+        function clearSession() {
+            localStorage.removeItem('filewizard_session_id');
+            document.getElementById('session-result').innerHTML =
+                `<div class="success">Session cleared. Click "Check Current Session ID" to generate a new one.</div>`;
+        }
+
+        async function testJobsApi() {
+            try {
+                const response = await fetch('/jobs');
+                const data = await response.json();
+                document.getElementById('api-result').innerHTML =
+                    `<div class="success">/jobs API responded with ${data.length} jobs</div>`;
+            } catch (e) {
+                document.getElementById('api-result').innerHTML =
+                    `<div class="error">API call failed: ${e.message}</div>`;
+            }
+        }
+
+        async function testConvertApi() {
+            try {
+                // This will fail due to missing form data, but we can check if session_id is included
+                const formData = new FormData();
+                formData.append('file', new Blob(['test']), 'test.txt');
+                formData.append('output_format', 'pdf');
+
+                const response = await fetch('/convert-file', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                document.getElementById('api-result').innerHTML =
+                    `<div class="success">/convert-file API responded with status ${response.status}</div>`;
+            } catch (e) {
+                document.getElementById('api-result').innerHTML =
+                    `<div class="success">/convert-file API call made (expected to fail without proper data)</div>`;
+            }
+        }
+
+        // Auto-check on page load
+        window.onload = function() {
+            updateStorageMode();
+            checkSessionId();
+        };
+    </script>
+</body>
+</html>

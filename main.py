@@ -224,8 +224,24 @@ logger = logging.getLogger(__name__)
 
 # --- Environment Mode ---
 LOCAL_ONLY_MODE = os.getenv('LOCAL_ONLY', 'True').lower() in ('true', '1', 't')
+SESSION_BASED_SCOPING = os.getenv('SESSION_BASED_SCOPING', 'False').lower() in ('true', '1', 't')
+
+# Validate mutually exclusive modes
+if SESSION_BASED_SCOPING and not LOCAL_ONLY_MODE:
+    raise ValueError(
+        "SESSION_BASED_SCOPING=True requires LOCAL_ONLY=True.\n"
+        "Session-based scoping is only available in anonymous/local mode.\n"
+        "For authenticated users, use SESSION_BASED_SCOPING=False and LOCAL_ONLY=False."
+    )
+
 if LOCAL_ONLY_MODE:
     logger.warning("Authentication is DISABLED. Running in LOCAL_ONLY mode.")
+    if SESSION_BASED_SCOPING:
+        logger.info("Session-based job scoping is ENABLED. Jobs will be scoped to anonymous sessions.")
+    else:
+        logger.warning("Session-based scoping is DISABLED. All users will share the same job history.")
+else:
+    logger.info("Authentication is ENABLED. Users will be scoped by their authenticated identity.")
 
 class AppPaths(BaseModel):
     BASE_DIR: Path = Path(__file__).resolve().parent
@@ -538,6 +554,7 @@ class Job(Base):
     __tablename__ = "jobs"
     id = Column(String, primary_key=True, index=True)
     user_id = Column(String, index=True, nullable=True)
+    session_id = Column(String, index=True, nullable=True)
     parent_job_id = Column(String, index=True, nullable=True)
     task_type = Column(String, index=True)
     status = Column(String, default="pending")
@@ -563,6 +580,7 @@ def get_db():
 class JobCreate(BaseModel):
     id: str
     user_id: str | None = None
+    session_id: str | None = None
     parent_job_id: str | None = None
     task_type: str
     original_filename: str
@@ -623,9 +641,11 @@ def get_job(db: Session, job_id: str):
     # return db.query(Job).filter(Job.id == job_id).first()
     return  db.query(Job).filter(Job.id == job_id).first()
 
-def get_jobs(db: Session, user_id: str | None = None, skip: int = 0, limit: int = 100):
+def get_jobs(db: Session, user_id: str | None = None, session_id: str | None = None, skip: int = 0, limit: int = 100):
     query = db.query(Job)
-    if user_id:
+    if SESSION_BASED_SCOPING and session_id:
+        query = query.filter(Job.session_id == session_id)
+    elif user_id:
         query = query.filter(Job.user_id == user_id)
     return query.order_by(Job.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -742,6 +762,7 @@ WHISPER_MODELS_LAST_USED: Dict[str, float] = {}
 
 # --- Cache Eviction Settings ---
 _cache_cleanup_thread: Optional[threading.Thread] = None
+_file_cleanup_thread: Optional[threading.Thread] = None
 _cache_lock = threading.Lock() # Global lock for modifying cache dictionaries
 _model_locks: Dict[str, threading.Lock] = {}
 _global_lock = threading.Lock() # Lock for initializing model-specific locks
@@ -834,6 +855,81 @@ def get_whisper_model(model_size: str, whisper_settings: dict) -> Any:
         except Exception as e:
             logger.error(f"Model '{model_size}' failed to load: {str(e)}", exc_info=True)
             raise RuntimeError(f"Whisper model initialization failed: {e}") from e
+
+def _file_cleanup_worker():
+    """
+    Periodically cleans up old files from upload, processed, and temp directories.
+    Respects retention times configured via environment variables.
+    """
+    while True:
+        # Read settings from environment variables for security
+        cleanup_enabled = os.getenv('FILE_CLEANUP_ENABLED', 'true').lower() in ('true', '1', 't')
+        cleanup_interval = int(os.getenv('FILE_CLEANUP_INTERVAL', '3600'))  # 1 hour default
+
+        if not cleanup_enabled:
+            time.sleep(cleanup_interval)
+            continue
+
+        time.sleep(cleanup_interval)
+
+        try:
+            # Get retention times from environment variables (in seconds)
+            upload_retention = int(os.getenv('UPLOAD_FILE_RETENTION', '86400'))      # 24 hours
+            processed_retention = int(os.getenv('PROCESSED_FILE_RETENTION', '604800')) # 7 days
+            temp_retention = int(os.getenv('TEMP_FILE_RETENTION', '3600'))            # 1 hour
+
+            current_time = time.time()
+            total_cleaned = 0
+
+            # Clean upload directory
+            if PATHS.UPLOADS_DIR.exists():
+                for file_path in PATHS.UPLOADS_DIR.glob("*"):
+                    if file_path.is_file() and file_path.stat().st_mtime < current_time - upload_retention:
+                        try:
+                            file_path.unlink()
+                            logger.debug(f"Cleaned old upload file: {file_path.name}")
+                            total_cleaned += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to clean upload file {file_path}: {e}")
+
+            # Clean processed directory
+            if PATHS.PROCESSED_DIR.exists():
+                for file_path in PATHS.PROCESSED_DIR.glob("*"):
+                    if file_path.is_file() and file_path.stat().st_mtime < current_time - processed_retention:
+                        try:
+                            file_path.unlink()
+                            logger.debug(f"Cleaned old processed file: {file_path.name}")
+                            total_cleaned += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to clean processed file {file_path}: {e}")
+
+            # Clean temp chunk directory
+            if PATHS.CHUNK_TMP_DIR.exists():
+                for file_path in PATHS.CHUNK_TMP_DIR.glob("*"):
+                    if file_path.is_file() and file_path.stat().st_mtime < current_time - temp_retention:
+                        try:
+                            file_path.unlink()
+                            logger.debug(f"Cleaned old temp file: {file_path.name}")
+                            total_cleaned += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to clean temp file {file_path}: {e}")
+
+            # Also clean up empty subdirectories in uploads (like unzipped_* directories)
+            if PATHS.UPLOADS_DIR.exists():
+                for dir_path in PATHS.UPLOADS_DIR.glob("**/"):
+                    if dir_path.is_dir() and not any(dir_path.iterdir()):
+                        try:
+                            dir_path.rmdir()
+                            logger.debug(f"Cleaned empty directory: {dir_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to clean empty directory {dir_path}: {e}")
+
+            if total_cleaned > 0:
+                logger.info(f"File cleanup completed: removed {total_cleaned} old files")
+
+        except Exception as e:
+            logger.error(f"File cleanup worker error: {e}", exc_info=True)
+            # Continue running even if there's an error
 
 def _get_or_create_model_lock(model_size: str) -> threading.Lock:
     """Thread-safe lock acquisition with minimal global contention"""
@@ -2103,7 +2199,7 @@ def run_conversion_task(job_id: str,
         except Exception:
             logger.exception("Failed to send webhook notification after conversion.")
 
-def dispatch_single_file_job(original_filename: str, input_filepath: str, task_type: str, user: dict, db: Session, app_config: Dict, base_url: str, job_id: str | None = None, options: Dict = None, parent_job_id: str | None = None):
+def dispatch_single_file_job(original_filename: str, input_filepath: str, task_type: str, user: dict, db: Session, app_config: Dict, base_url: str, job_id: str | None = None, options: Dict = None, parent_job_id: str | None = None, session_id: str | None = None):
     """Helper to create and dispatch a job for a single file."""
     if options is None:
         options = {}
@@ -2121,7 +2217,10 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
         return
 
     job_data = JobCreate(
-        id=job_id, user_id=user['sub'], task_type=task_type,
+        id=job_id,
+        user_id=user['sub'] if not SESSION_BASED_SCOPING else None,
+        session_id=session_id if SESSION_BASED_SCOPING else None,
+        task_type=task_type,
         original_filename=original_filename, input_filepath=str(final_path),
         input_filesize=final_path.stat().st_size,
         parent_job_id=parent_job_id
@@ -2359,7 +2458,7 @@ def _update_parent_zip_job_progress(parent_job_id: str):
 
 
 @huey.task()
-def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str, sub_task_options: dict, user: dict, app_config: dict, base_url: str):
+def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str, sub_task_options: dict, user: dict, app_config: dict, base_url: str, session_id: str | None = None):
     db = SessionLocal()
     input_path = Path(input_path_str)
     unzip_dir = PATHS.UPLOADS_DIR / f"unzipped_{job_id}"
@@ -2385,7 +2484,8 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
                     db=db,
                     app_config=app_config,
                     base_url=base_url,
-                    parent_job_id=job_id
+                    parent_job_id=job_id,
+                    session_id=session_id
                 )
         if file_count > 0:
             # Mark parent job as processing, to be completed by the periodic task
@@ -2492,6 +2592,38 @@ async def lifespan(app: FastAPI):
             with engine.begin() as conn:
                 Base.metadata.create_all(bind=conn)
             logger.info("Database tables ensured (create_all succeeded).")
+
+            # Auto-migrate database schema for session-based scoping
+            if SESSION_BASED_SCOPING:
+                # Use a separate connection for migration to avoid connection pooling issues
+                migration_conn = None
+                try:
+                    migration_conn = engine.connect()
+                    with migration_conn.begin():
+                        result = migration_conn.execute(text("PRAGMA table_info(jobs)"))
+                        columns = result.fetchall()
+                        column_names = [col[1] for col in columns]
+
+                        if 'session_id' not in column_names:
+                            logger.info("Session-based scoping enabled but session_id column missing. Running auto-migration...")
+
+                            # Add the session_id column
+                            migration_conn.execute(text("ALTER TABLE jobs ADD COLUMN session_id TEXT"))
+
+                            # Create index on session_id for performance
+                            migration_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_session_id ON jobs(session_id)"))
+
+                            logger.info("✓ Auto-migration completed: added session_id column and index")
+                        else:
+                            logger.info("✓ Session-based scoping database schema verified.")
+                except Exception as e:
+                    logger.error(f"Failed to auto-migrate database schema: {e}")
+                    logger.error("Please check database permissions or run migration manually with: python migrate_session_scoping.py")
+                    raise
+                finally:
+                    if migration_conn:
+                        migration_conn.close()
+
             break
         except OperationalError as oe:
             # Some SQLite drivers raise an OperationalError when two processes try to create the same table at once.
@@ -2522,6 +2654,13 @@ async def lifespan(app: FastAPI):
         _cache_cleanup_thread = threading.Thread(target=_whisper_cache_cleanup_worker, daemon=True)
         _cache_cleanup_thread.start()
         logger.info("Whisper model cache cleanup thread started.")
+
+    # Start file cleanup thread
+    global _file_cleanup_thread
+    if _file_cleanup_thread is None:
+        _file_cleanup_thread = threading.Thread(target=_file_cleanup_worker, daemon=True)
+        _file_cleanup_thread.start()
+        logger.info("File cleanup thread started.")
 
     # Download required models on startup
     DOWNLOAD_KOKORO_ON_STARTUP = os.environ.get('DOWNLOAD_KOKORO_ON_STARTUP', 'false').lower() == 'true'
@@ -2651,6 +2790,39 @@ templates = Jinja2Templates(directory=str(PATHS.BASE_DIR / "templates"))
 
 # --- AUTH & USER HELPERS ---
 http_bearer = HTTPBearer()
+
+# --- SESSION HELPERS ---
+def generate_session_id() -> str:
+    """Generate a secure random session ID."""
+    return secrets.token_urlsafe(32)
+
+def get_session_id_from_request(request: Request) -> str | None:
+    """Extract session ID from request query params or headers."""
+    session_id = request.query_params.get('session_id')
+    if not session_id:
+        session_id = request.headers.get('X-Session-ID')
+    return session_id
+
+def validate_session_id(session_id: str) -> bool:
+    """Validate session ID format and length."""
+    if not session_id:
+        return False
+    # Basic validation - should be URL-safe base64, ~43 characters
+    return len(session_id) >= 32 and session_id.replace('-', '').replace('_', '').isalnum()
+
+def get_effective_user_id(request: Request) -> str:
+    """Get the effective user ID based on current configuration."""
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if session_id and validate_session_id(session_id):
+            return session_id
+        # If no valid session ID, this will cause jobs to be unscoped
+        # Frontend should always provide session_id when SESSION_BASED_SCOPING is enabled
+        return None
+    else:
+        # Use traditional user-based authentication
+        user = get_current_user(request)
+        return user.get('sub') if user else None
 
 def get_current_user(request: Request):
     if LOCAL_ONLY_MODE:
@@ -2850,7 +3022,8 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
     if tool == 'pandoc_academic':
         # This is a single job that processes a ZIP file as a project.
         options = {"output_format": payload.output_format}
-        dispatch_single_file_job(payload.original_filename, str(final_path), "conversion", user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
+        session_id = get_session_id_from_request(request) if SESSION_BASED_SCOPING else None
+        dispatch_single_file_job(payload.original_filename, str(final_path), "conversion", user, db, APP_CONFIG, base_url, job_id=job_id, options=options, session_id=session_id)
 
     elif Path(safe_filename).suffix.lower() == '.zip':
         # This is the original batch processing logic for ZIP files.
@@ -2865,11 +3038,13 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
             "model_name": payload.model_name,
             "output_format": payload.output_format
         }
-        unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, sub_task_options, user, APP_CONFIG, base_url)
+        session_id = get_session_id_from_request(request) if SESSION_BASED_SCOPING else None
+        unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, sub_task_options, user, APP_CONFIG, base_url, session_id)
     else:
         # This is the logic for all other single-file uploads.
         options = {"model_size": payload.model_size, "model_name": payload.model_name, "output_format": payload.output_format, "generate_timestamps": payload.generate_timestamps}
-        dispatch_single_file_job(payload.original_filename, str(final_path), payload.task_type, user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
+        session_id = get_session_id_from_request(request) if SESSION_BASED_SCOPING else None
+        dispatch_single_file_job(payload.original_filename, str(final_path), payload.task_type, user, db, APP_CONFIG, base_url, job_id=job_id, options=options, session_id=session_id)
 
     # --- FIX STARTS HERE ---
     # Instead of returning a minimal object, fetch the newly created job
@@ -2894,8 +3069,18 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
 async def submit_audio_transcription(
     request: Request, file: UploadFile = File(...), model_size: str = Form("base"),
     generate_timestamps: bool = Form(False),
-    db: Session = Depends(get_db), user: dict = Depends(require_user)
+    db: Session = Depends(get_db)
 ):
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=400, detail="Valid session_id required")
+        user = {'sub': session_id}
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
     allowed_audio_exts = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus"}
     if not is_allowed_file(file.filename, allowed_audio_exts):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid audio file type.")
@@ -2912,14 +3097,33 @@ async def submit_audio_transcription(
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
 
-    job_data = JobCreate(id=job_id, user_id=user['sub'], task_type="transcription", original_filename=file.filename,
-                         input_filepath=str(upload_path), input_filesize=input_size, processed_filepath=str(processed_path))
+    session_id = get_session_id_from_request(request) if SESSION_BASED_SCOPING else None
+    job_data = JobCreate(
+        id=job_id,
+        user_id=None if SESSION_BASED_SCOPING else user['sub'],
+        session_id=session_id if SESSION_BASED_SCOPING else None,
+        task_type="transcription",
+        original_filename=file.filename,
+        input_filepath=str(upload_path),
+        input_filesize=input_size,
+        processed_filepath=str(processed_path)
+    )
     new_job = create_job(db=db, job=job_data)
     run_transcription_task(new_job.id, str(upload_path), str(processed_path), model_size, whisper_settings=whisper_config, app_config=APP_CONFIG, base_url=base_url, generate_timestamps=generate_timestamps)
     return {"job_id": new_job.id, "status": new_job.status, "status_url": f"/job/{new_job.id}"}
 
 @app.post("/convert-file", status_code=status.HTTP_202_ACCEPTED)
-async def submit_file_conversion(request: Request, file: UploadFile = File(...), output_format: str = Form(...), db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def submit_file_conversion(request: Request, file: UploadFile = File(...), output_format: str = Form(...), db: Session = Depends(get_db)):
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=400, detail="Valid session_id required")
+        user = {'sub': session_id}  # Use session_id as user identifier
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
     allowed_exts = APP_CONFIG.get("app_settings", {}).get("allowed_all_extensions", set())
     if not is_allowed_file(file.filename, allowed_exts):
         raise HTTPException(status_code=400, detail=f"File type '{Path(file.filename).suffix}' not allowed.")
@@ -2939,14 +3143,33 @@ async def submit_file_conversion(request: Request, file: UploadFile = File(...),
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
 
-    job_data = JobCreate(id=job_id, user_id=user['sub'], task_type="conversion", original_filename=file.filename,
-                         input_filepath=str(upload_path), input_filesize=input_size, processed_filepath=str(processed_path))
+    session_id = get_session_id_from_request(request) if SESSION_BASED_SCOPING else None
+    job_data = JobCreate(
+        id=job_id,
+        user_id=None if SESSION_BASED_SCOPING else user['sub'],
+        session_id=session_id if SESSION_BASED_SCOPING else None,
+        task_type="conversion",
+        original_filename=file.filename,
+        input_filepath=str(upload_path),
+        input_filesize=input_size,
+        processed_filepath=str(processed_path)
+    )
     new_job = create_job(db=db, job=job_data)
     run_conversion_task(new_job.id, str(upload_path), str(processed_path), tool, task_key, conversion_tools, APP_CONFIG, base_url)
     return {"job_id": new_job.id, "status": new_job.status, "status_url": f"/job/{new_job.id}"}
 
 @app.post("/ocr-pdf", status_code=status.HTTP_202_ACCEPTED)
-async def submit_pdf_ocr(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def submit_pdf_ocr(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=400, detail="Valid session_id required")
+        user = {'sub': session_id}
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
     if not is_allowed_file(file.filename, {".pdf"}):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PDF.")
     job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
@@ -2956,15 +3179,34 @@ async def submit_pdf_ocr(request: Request, file: UploadFile = File(...), db: Ses
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
 
-    job_data = JobCreate(id=job_id, user_id=user['sub'], task_type="ocr", original_filename=file.filename,
-                         input_filepath=str(upload_path), input_filesize=input_size, processed_filepath=str(processed_path))
+    session_id = get_session_id_from_request(request) if SESSION_BASED_SCOPING else None
+    job_data = JobCreate(
+        id=job_id,
+        user_id=None if SESSION_BASED_SCOPING else user['sub'],
+        session_id=session_id if SESSION_BASED_SCOPING else None,
+        task_type="ocr",
+        original_filename=file.filename,
+        input_filepath=str(upload_path),
+        input_filesize=input_size,
+        processed_filepath=str(processed_path)
+    )
     new_job = create_job(db=db, job=job_data)
     ocr_settings = APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {})
     run_pdf_ocr_task(new_job.id, str(upload_path), str(processed_path), ocr_settings, APP_CONFIG, base_url)
     return {"job_id": new_job.id, "status": new_job.status, "status_url": f"/job/{new_job.id}"}
 
 @app.post("/ocr-image", status_code=status.HTTP_202_ACCEPTED)
-async def submit_image_ocr(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def submit_image_ocr(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=400, detail="Valid session_id required")
+        user = {'sub': session_id}
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
     allowed_exts = {".png", ".jpg", ".jpeg", ".tiff", ".tif"}
     if not is_allowed_file(file.filename, allowed_exts):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PNG, JPG, or TIFF.")
@@ -2976,8 +3218,17 @@ async def submit_image_ocr(request: Request, file: UploadFile = File(...), db: S
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
 
-    job_data = JobCreate(id=job_id, user_id=user['sub'], task_type="ocr-image", original_filename=file.filename,
-                         input_filepath=str(upload_path), input_filesize=input_size, processed_filepath=str(processed_path))
+    session_id = get_session_id_from_request(request) if SESSION_BASED_SCOPING else None
+    job_data = JobCreate(
+        id=job_id,
+        user_id=None if SESSION_BASED_SCOPING else user['sub'],
+        session_id=session_id if SESSION_BASED_SCOPING else None,
+        task_type="ocr-image",
+        original_filename=file.filename,
+        input_filepath=str(upload_path),
+        input_filesize=input_size,
+        processed_filepath=str(processed_path)
+    )
     new_job = create_job(db=db, job=job_data)
     run_image_ocr_task(new_job.id, str(upload_path), str(processed_path), APP_CONFIG, base_url)
     return {"job_id": new_job.id, "status": new_job.status, "status_url": f"/job/{new_job.id}"}
@@ -3256,7 +3507,8 @@ async def get_index(request: Request):
     return templates.TemplateResponse("index.html", {
         "request": request, "user": user, "is_admin": admin_status,
         "whisper_models": sorted(list(whisper_models)),
-        "conversion_tools": conversion_tools, "local_only_mode": LOCAL_ONLY_MODE
+        "conversion_tools": conversion_tools, "local_only_mode": LOCAL_ONLY_MODE,
+        "session_based_scoping": SESSION_BASED_SCOPING
     })
 
 @app.get("/settings")
@@ -3264,6 +3516,11 @@ async def get_settings_page(request: Request):
     """Displays the contents of the currently active configuration."""
     user = get_current_user(request)
     admin_status = is_admin(request)
+
+    # In session-based mode, restrict settings access to prevent anonymous users
+    # from seeing configuration details that might help them game the system
+    if SESSION_BASED_SCOPING and not user:
+        raise HTTPException(status_code=401, detail="Authentication required for settings access")
 
     # Use the globally loaded and merged APP_CONFIG for consistency
     # Ensure all required keys exist for template rendering
@@ -3561,8 +3818,19 @@ async def cancel_job(job_id: str, db: Session = Depends(get_db), user: dict = De
     raise HTTPException(status_code=400, detail=f"Job is already in a final state ({job.status}).")
 
 @app.get("/jobs", response_model=List[JobSchema])
-async def get_all_jobs(db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    return get_jobs(db, user_id=user['sub'])
+async def get_all_jobs(request: Request, db: Session = Depends(get_db)):
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            # Return empty list if no valid session ID provided
+            return []
+        return get_jobs(db, session_id=session_id)
+    else:
+        # Traditional user-based authentication
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return get_jobs(db, user_id=user['sub'])
 
 @app.get("/job/{job_id}", response_model=JobSchema)
 async def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
@@ -3592,33 +3860,75 @@ async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_d
 
 
 @app.get("/download/{filename}")
-async def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def download_file(filename: str, request: Request, db: Session = Depends(get_db)):
     file_path = ensure_path_is_safe(PATHS.PROCESSED_DIR / filename, [PATHS.PROCESSED_DIR])
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
-    # API users can download files they own via webhook URL. UI users need session.
-    job_owner_id = user.get('sub') if user else None
-    job = db.query(Job).filter(Job.processed_filepath == str(file_path), Job.user_id == job_owner_id).first()
+
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=401, detail="Valid session required")
+        user_id = None
+        session_id_filter = session_id
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_id = user.get('sub')
+        session_id_filter = None
+
+    # Find the job with proper ownership check
+    query = db.query(Job).filter(Job.processed_filepath == str(file_path))
+    if SESSION_BASED_SCOPING:
+        query = query.filter(Job.session_id == session_id_filter)
+    else:
+        query = query.filter(Job.user_id == user_id)
+
+    job = query.first()
     if not job:
         raise HTTPException(status_code=403, detail="You do not have permission to download this file.")
+
     download_filename = Path(job.original_filename).stem + Path(job.processed_filepath).suffix
     return FileResponse(path=file_path, filename=download_filename, media_type="application/octet-stream")
 
 @app.post("/download/batch", response_class=StreamingResponse)
-async def download_batch(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def download_batch(payload: JobSelection, request: Request, db: Session = Depends(get_db)):
     job_ids = payload.job_ids
     if not job_ids:
         raise HTTPException(status_code=400, detail="No job IDs provided.")
+
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=401, detail="Valid session required")
+        user_id = session_id
+        use_session_check = True
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_id = user.get('sub')
+        use_session_check = False
 
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
         for job_id in job_ids:
             job = get_job(db, job_id)
-            if job and job.user_id == user['sub'] and job.status == 'completed' and job.processed_filepath:
-                file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
-                if file_path.exists():
-                    download_filename = f"{Path(job.original_filename).stem}_{job_id}{file_path.suffix}"
-                    zip_file.write(file_path, arcname=download_filename)
+            if job and job.status == 'completed' and job.processed_filepath:
+                # Check ownership based on scoping mode
+                if use_session_check:
+                    has_permission = job.session_id == user_id
+                else:
+                    has_permission = job.user_id == user_id
+
+                if has_permission:
+                    file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
+                    if file_path.exists():
+                        download_filename = f"{Path(job.original_filename).stem}_{job_id}{file_path.suffix}"
+                        zip_file.write(file_path, arcname=download_filename)
 
     zip_buffer.seek(0)
     return StreamingResponse(zip_buffer, media_type="application/x-zip-compressed", headers={
@@ -3626,11 +3936,36 @@ async def download_batch(payload: JobSelection, db: Session = Depends(get_db), u
     })
 
 @app.get("/download/zip-batch/{job_id}", response_class=StreamingResponse)
-async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def download_zip_batch(job_id: str, request: Request, db: Session = Depends(get_db)):
     """Downloads all processed files from a ZIP upload batch as a new ZIP file."""
+
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=401, detail="Valid session required")
+        user_id = session_id
+        use_session_check = True
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_id = user.get('sub')
+        use_session_check = False
+
     parent_job = get_job(db, job_id)
-    if not parent_job or parent_job.user_id != user['sub']:
+    if not parent_job:
         raise HTTPException(status_code=404, detail="Parent job not found.")
+
+    # Check ownership based on scoping mode
+    if use_session_check:
+        has_permission = parent_job.session_id == user_id
+    else:
+        has_permission = parent_job.user_id == user_id
+
+    if not has_permission:
+        raise HTTPException(status_code=404, detail="Parent job not found.")
+
     if parent_job.task_type != 'unzip':
         raise HTTPException(status_code=400, detail="This job is not a batch upload.")
 

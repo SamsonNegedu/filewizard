@@ -11,6 +11,10 @@ document.addEventListener('DOMContentLoaded', () => {
         hour: 'numeric', minute: '2-digit', timeZone: USER_TIMEZONE,
     };
 
+    // --- Session Storage Configuration ---
+    // Set to true for per-tab isolation, false for per-window isolation (recommended)
+    const USE_SESSION_STORAGE = false; // Default: per-window (recommended)
+
     // --- Element Selectors ---
     const appContainer = document.getElementById('app-container');
     const loginContainer = document.getElementById('login-container');
@@ -68,10 +72,162 @@ document.addEventListener('DOMContentLoaded', () => {
         return path.startsWith('/') ? `${API_BASE}${path}` : `${API_BASE}/${path}`;
     }
 
+    // --- Session Management ---
+    function generateSessionId() {
+        // Generate a URL-safe base64 string (43 characters)
+        const array = new Uint8Array(32);
+        crypto.getRandomValues(array);
+        return btoa(String.fromCharCode(...array))
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=/g, '');
+    }
+
+    function isStorageAvailable(storage) {
+        try {
+            const testKey = '__storage_test__';
+            storage.setItem(testKey, 'test');
+            storage.removeItem(testKey);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function getCookie(name) {
+        const value = `; ${document.cookie}`;
+        const parts = value.split(`; ${name}=`);
+        if (parts.length === 2) return parts.pop().split(';').shift();
+        return null;
+    }
+
+    function setCookie(name, value, days = 365) {
+        const expires = new Date();
+        expires.setTime(expires.getTime() + days * 24 * 60 * 60 * 1000);
+        document.cookie = `${name}=${value};expires=${expires.toUTCString()};path=/;SameSite=Lax`;
+    }
+
+    function getSessionId() {
+        // Try different storage mechanisms in order of preference
+        const storageOptions = [
+            { name: 'localStorage', storage: localStorage, available: isStorageAvailable(localStorage) },
+            { name: 'sessionStorage', storage: sessionStorage, available: isStorageAvailable(sessionStorage) },
+            { name: 'cookies', storage: null, available: true } // Cookies always available
+        ];
+
+        const key = 'filewizard_session_id';
+
+        // Try to get existing session ID from available storage
+        for (const option of storageOptions) {
+            if (!option.available) continue;
+
+            try {
+                let sessionId = null;
+
+                if (option.storage) {
+                    // Web Storage API
+                    sessionId = option.storage.getItem(key);
+                } else {
+                    // Cookies
+                    sessionId = getCookie(key);
+                }
+
+                if (sessionId) {
+                    console.log(`[Session] Found existing session_id in ${option.name}: ${sessionId}`);
+                    return sessionId;
+                }
+            } catch (error) {
+                console.warn(`[Session] Failed to read from ${option.name}:`, error);
+            }
+        }
+
+        // Generate new session ID and store in all available locations
+        const sessionId = generateSessionId();
+        console.log(`[Session] Generated new session_id: ${sessionId}`);
+
+        let storedIn = [];
+        for (const option of storageOptions) {
+            if (!option.available) continue;
+
+            try {
+                if (option.storage) {
+                    option.storage.setItem(key, sessionId);
+                } else {
+                    setCookie(key, sessionId);
+                }
+                storedIn.push(option.name);
+            } catch (error) {
+                console.warn(`[Session] Failed to store in ${option.name}:`, error);
+            }
+        }
+
+        if (storedIn.length === 0) {
+            console.warn(`[Session] Could not store session_id in any storage mechanism!`);
+        } else {
+            console.log(`[Session] Stored session_id in: ${storedIn.join(', ')}`);
+        }
+
+        return sessionId;
+    }
+
+    // Debug function - can be called from browser console
+    window.getFileWizardSessionId = function() {
+        const sessionId = getSessionId();
+        console.log(`Current FileWizard session_id: ${sessionId}`);
+
+        // Check all storage locations
+        const storages = [
+            { name: 'localStorage', storage: localStorage },
+            { name: 'sessionStorage', storage: sessionStorage },
+            { name: 'cookies', storage: null }
+        ];
+
+        console.log('Session ID locations:');
+        storages.forEach(({ name, storage }) => {
+            try {
+                let value = null;
+                if (storage) {
+                    value = storage.getItem('filewizard_session_id');
+                } else {
+                    value = getCookie('filewizard_session_id');
+                }
+                console.log(`  ${name}: ${value || 'not found'}`);
+            } catch (e) {
+                console.log(`  ${name}: error - ${e.message}`);
+            }
+        });
+
+        return sessionId;
+    };
+
+    // Debug function to clear all session storage
+    window.clearFileWizardSession = function() {
+        try { localStorage.removeItem('filewizard_session_id'); } catch (e) {}
+        try { sessionStorage.removeItem('filewizard_session_id'); } catch (e) {}
+        document.cookie = 'filewizard_session_id=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
+        console.log('[Session] Cleared session from all storage locations');
+    };
+
     async function authFetch(url, options = {}) {
+        // Check for session_id inclusion BEFORE URL transformation
+        const originalUrl = url;
+        const needsSessionId = typeof originalUrl === 'string' &&
+            (originalUrl.includes('/jobs') || originalUrl.includes('/convert') ||
+             originalUrl.includes('/ocr') || originalUrl.includes('/transcribe') ||
+             originalUrl.includes('/upload'));
+
         if (typeof url === 'string' && url.startsWith('/')) {
             url = apiUrl(url);
         }
+
+        // Add session_id to query parameters for job-related API calls
+        if (needsSessionId) {
+            const sessionId = getSessionId();
+            console.log(`[Session] Adding session_id=${sessionId} to ${originalUrl}`);
+            const separator = url.includes('?') ? '&' : '?';
+            url = `${url}${separator}session_id=${sessionId}`;
+        }
+
         options = { credentials: 'include', ...options };
         options.headers = { Accept: 'application/json', ...options.headers };
 
@@ -186,10 +342,16 @@ document.addEventListener('DOMContentLoaded', () => {
             actionHtml = `<button class="cancel-button" data-job-id="${job.id}"><i class="fa">&#xf00d;</i></button>`;
         } else if (job.status === 'completed') {
             if (job.task_type === 'unzip') {
-                actionHtml = `<a href="${apiUrl('/download/zip-batch')}/${encodeURIComponent(job.id)}" class="download-button" download><i class="fa">&#xf019;</i> Batch</a>`;
+                const sessionId = getSessionId();
+                const separator = '?';
+                const batchDownloadUrl = `${apiUrl('/download/zip-batch')}/${encodeURIComponent(job.id)}${separator}session_id=${sessionId}`;
+                actionHtml = `<a href="${batchDownloadUrl}" class="download-button" download><i class="fa">&#xf019;</i> Batch</a>`;
             } else if (job.processed_filepath) {
                 const downloadFilename = job.processed_filepath.split(/[\\\/]/).pop();
-                actionHtml = `<a href="${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}" class="download-button" download><i class="fa">&#xf019;</i></a>`;
+                const sessionId = getSessionId();
+                const separator = '?';
+                const downloadUrl = `${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}${separator}session_id=${sessionId}`;
+                actionHtml = `<a href="${downloadUrl}" class="download-button" download><i class="fa">&#xf019;</i></a>`;
             }
         } else if (job.status === 'failed') {
             const errorTitle = job.error_message ? ` title="${job.error_message.replace(/"/g, '&quot;')}"` : '';
@@ -239,7 +401,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     const downloadLink = detailsRow.querySelector('.details-download-link');
                     if (downloadLink) {
                         const downloadFilename = job.processed_filepath.split(/[\\\/]/).pop();
-                        downloadLink.href = `${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}`;
+                        const sessionId = getSessionId();
+                        const separator = '?';
+                        downloadLink.href = `${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}${separator}session_id=${sessionId}`;
                         downloadLink.textContent = downloadFilename;
                     }
                 }
@@ -331,7 +495,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         ${job.processed_filepath && job.status === 'completed' && job.task_type !== 'unzip' ? 
                             `<div class="detail-item">
                                 <span class="detail-label">Download:</span>
-                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}" download>
+                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}?session_id=${getSessionId()}" download>
                                     ${job.processed_filepath.split(/[\\\/]/).pop()}
                                 </a>
                             </div>` : ''}
@@ -922,7 +1086,7 @@ function initializeSelectors() {
                                         ${job.processed_filepath && job.status === 'completed' && job.task_type !== 'unzip' ? 
                                             `<div class="detail-item">
                                                 <span class="detail-label">Download:</span>
-                                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}" download>
+                                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}?session_id=${getSessionId()}" download>
                                                     ${job.processed_filepath.split(/[\\\/]/).pop()}
                                                 </a>
                                             </div>` : ''}

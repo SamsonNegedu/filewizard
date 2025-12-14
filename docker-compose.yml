@@ -1,7 +1,6 @@
-version: "3.9"
 services:
   web:
-    image: loredcast/filewizard:latest
+    image: filewizard:latest # Local image name (avoid pulling remote)
     build:
       context: .
       target: full-final # Change to 'full-final' or 'small-final' as needed
@@ -14,6 +13,14 @@ services:
       - PROCESSED_DIR=/app/processed
       - OMP_NUM_THREADS=1
       - DOWNLOAD_KOKORO_ON_STARTUP=true
+      # Session-based scoping (optional - enables anonymous session isolation)
+      - SESSION_BASED_SCOPING=True # set to True to enable session-based job scoping
+      # File cleanup (optional - automatically removes old files)
+      - FILE_CLEANUP_ENABLED=true
+      - FILE_CLEANUP_INTERVAL=3600 # Check every hour
+      - UPLOAD_FILE_RETENTION=3600 # Keep uploads 24 hours
+      - PROCESSED_FILE_RETENTION=3600 # Keep processed files 7 days
+      - TEMP_FILE_RETENTION=3600 # Clean temp files after 1 hour
       #- TRANSCRIPTION_DEVICE=cpu  # change to 'cuda' if GPU available
       #- TRANSCRIPTION_COMPUTE_TYPE=int8 # change to 'float16' or 'int8_float16' if GPU available
       #- TRANSCRIPTION_DEVICE_INDEX=0 # change if multiple GPUs available
