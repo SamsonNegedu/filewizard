@@ -767,6 +767,192 @@ _cache_lock = threading.Lock() # Global lock for modifying cache dictionaries
 _model_locks: Dict[str, threading.Lock] = {}
 _global_lock = threading.Lock() # Lock for initializing model-specific locks
 
+def _file_cleanup_worker():
+    """
+    Periodically cleans up old files from upload, processed, and temp directories.
+    Also removes orphaned job records for files that no longer exist.
+    """
+    logger.info("File cleanup worker started")
+    while True:
+        # Read settings from environment variables for security
+        cleanup_enabled = os.getenv('FILE_CLEANUP_ENABLED', 'true').lower() in ('true', '1', 't')
+        cleanup_interval = int(os.getenv('FILE_CLEANUP_INTERVAL', '3600'))  # 1 hour default
+
+        logger.info(f"File cleanup: enabled={cleanup_enabled}, interval={cleanup_interval}s")
+
+        if not cleanup_enabled:
+            logger.info("File cleanup disabled, sleeping...")
+            time.sleep(cleanup_interval)
+            continue
+
+        logger.info(f"Starting file cleanup cycle, sleeping for {cleanup_interval}s...")
+        time.sleep(cleanup_interval)
+        logger.info("File cleanup cycle started")
+
+        try:
+            # Get retention times from environment variables (in seconds)
+            upload_retention = int(os.getenv('UPLOAD_FILE_RETENTION', '86400'))      # 24 hours
+            processed_retention = int(os.getenv('PROCESSED_FILE_RETENTION', '604800')) # 7 days
+            temp_retention = int(os.getenv('TEMP_FILE_RETENTION', '3600'))            # 1 hour
+
+            logger.info(f"Cleanup retention times: uploads={upload_retention}s ({upload_retention/60:.1f}min), "
+                       f"processed={processed_retention}s ({processed_retention/60:.1f}min), "
+                       f"temp={temp_retention}s ({temp_retention/60:.1f}min)")
+
+            current_time = time.time()
+            total_cleaned = 0
+            db = None
+
+            try:
+                db = SessionLocal()
+                logger.info("Connected to database for cleanup")
+
+                # Clean upload directory
+                logger.info(f"Checking upload directory: {PATHS.UPLOADS_DIR}")
+                upload_files_found = 0
+                upload_files_cleaned = 0
+                if PATHS.UPLOADS_DIR.exists():
+                    for file_path in PATHS.UPLOADS_DIR.glob("*"):
+                        if file_path.is_file():
+                            upload_files_found += 1
+                            file_age = current_time - file_path.stat().st_mtime
+                            if file_age > upload_retention:
+                                try:
+                                    # Check if file is still referenced by any job
+                                    job_ref = db.query(Job).filter(Job.input_filepath == str(file_path)).first()
+                                    if not job_ref or job_ref.status in ['failed', 'cancelled']:
+                                        file_path.unlink()
+                                        logger.info(f"✓ Cleaned old upload file: {file_path.name} (age: {file_age:.1f}s)")
+                                        total_cleaned += 1
+                                        upload_files_cleaned += 1
+
+                                        # Also clean up the job record if it exists
+                                        if job_ref:
+                                            db.delete(job_ref)
+                                            logger.info(f"✓ Cleaned orphaned job record: {job_ref.id}")
+                                    else:
+                                        logger.info(f"⏭️ Skipping upload file {file_path.name} - still referenced by active job {job_ref.id} (status: {job_ref.status})")
+                                except Exception as e:
+                                    logger.warning(f"✗ Failed to clean upload file {file_path}: {e}")
+                    logger.info(f"Upload directory: found {upload_files_found} files, cleaned {upload_files_cleaned}")
+                else:
+                    logger.warning(f"Upload directory does not exist: {PATHS.UPLOADS_DIR}")
+
+                # Clean processed directory
+                logger.info(f"Checking processed directory: {PATHS.PROCESSED_DIR}")
+                processed_files_found = 0
+                processed_files_cleaned = 0
+                if PATHS.PROCESSED_DIR.exists():
+                    for file_path in PATHS.PROCESSED_DIR.glob("*"):
+                        if file_path.is_file():
+                            processed_files_found += 1
+                            file_age = current_time - file_path.stat().st_mtime
+                            if file_age > processed_retention:
+                                try:
+                                    # Check if file is still referenced by any job
+                                    job_ref = db.query(Job).filter(Job.processed_filepath == str(file_path)).first()
+                                    if not job_ref or job_ref.status in ['failed', 'cancelled']:
+                                        file_path.unlink()
+                                        logger.info(f"✓ Cleaned old processed file: {file_path.name} (age: {file_age:.1f}s)")
+                                        total_cleaned += 1
+                                        processed_files_cleaned += 1
+
+                                        # Also clean up the job record if it exists and no input file exists either
+                                        if job_ref:
+                                            input_exists = job_ref.input_filepath and Path(job_ref.input_filepath).exists()
+                                            if not input_exists:
+                                                db.delete(job_ref)
+                                                logger.info(f"✓ Cleaned orphaned job record: {job_ref.id}")
+                                    else:
+                                        logger.info(f"⏭️ Skipping processed file {file_path.name} - still referenced by active job {job_ref.id} (status: {job_ref.status})")
+                                except Exception as e:
+                                    logger.warning(f"✗ Failed to clean processed file {file_path}: {e}")
+                    logger.info(f"Processed directory: found {processed_files_found} files, cleaned {processed_files_cleaned}")
+                else:
+                    logger.warning(f"Processed directory does not exist: {PATHS.PROCESSED_DIR}")
+
+                # Clean temp chunk directory
+                logger.info(f"Checking temp directory: {PATHS.CHUNK_TMP_DIR}")
+                temp_files_found = 0
+                temp_files_cleaned = 0
+                if PATHS.CHUNK_TMP_DIR.exists():
+                    for file_path in PATHS.CHUNK_TMP_DIR.glob("*"):
+                        if file_path.is_file():
+                            temp_files_found += 1
+                            file_age = current_time - file_path.stat().st_mtime
+                            if file_age > temp_retention:
+                                try:
+                                    file_path.unlink()
+                                    logger.info(f"✓ Cleaned old temp file: {file_path.name} (age: {file_age:.1f}s)")
+                                    total_cleaned += 1
+                                    temp_files_cleaned += 1
+                                except Exception as e:
+                                    logger.warning(f"✗ Failed to clean temp file {file_path}: {e}")
+                    logger.info(f"Temp directory: found {temp_files_found} files, cleaned {temp_files_cleaned}")
+                else:
+                    logger.warning(f"Temp directory does not exist: {PATHS.CHUNK_TMP_DIR}")
+
+                # Also clean up empty subdirectories in uploads (like unzipped_* directories)
+                if PATHS.UPLOADS_DIR.exists():
+                    for dir_path in PATHS.UPLOADS_DIR.glob("**/"):
+                        if dir_path.is_dir() and not any(dir_path.iterdir()):
+                            try:
+                                dir_path.rmdir()
+                                logger.debug(f"Cleaned empty directory: {dir_path}")
+                            except OSError as e:
+                                # Skip "Device or resource busy" errors (common in Docker)
+                                if e.errno != 16:  # EBUSY - Device or resource busy
+                                    logger.warning(f"Failed to clean empty directory {dir_path}: {e}")
+                                else:
+                                    logger.debug(f"Skipped busy directory {dir_path} (normal in Docker)")
+                            except Exception as e:
+                                logger.warning(f"Failed to clean empty directory {dir_path}: {e}")
+
+                # Clean up orphaned job records (jobs referencing non-existent files)
+                logger.info("Checking for orphaned job records...")
+                orphaned_jobs = db.query(Job).filter(
+                    Job.status.in_(['completed', 'failed', 'cancelled'])
+                ).all()
+
+                orphaned_jobs_cleaned = 0
+                logger.info(f"Found {len(orphaned_jobs)} completed/failed/cancelled jobs to check for orphans")
+
+                for job in orphaned_jobs:
+                    input_missing = job.input_filepath and not Path(job.input_filepath).exists()
+                    output_missing = job.processed_filepath and not Path(job.processed_filepath).exists()
+
+                    # If both input and output files are missing, clean up the job
+                    if input_missing and (not job.processed_filepath or output_missing):
+                        try:
+                            db.delete(job)
+                            logger.info(f"✓ Cleaned orphaned job record: {job.id} (input_missing={input_missing}, output_missing={output_missing})")
+                            total_cleaned += 1
+                            orphaned_jobs_cleaned += 1
+                        except Exception as e:
+                            logger.warning(f"✗ Failed to clean orphaned job {job.id}: {e}")
+
+                logger.info(f"Orphaned jobs: checked {len(orphaned_jobs)}, cleaned {orphaned_jobs_cleaned}")
+
+                if total_cleaned > 0:
+                    db.commit()
+                    logger.info(f"]File cleanup completed: removed {total_cleaned} files/job records")
+                else:
+                    logger.info(f"File cleanup completed: no old files or orphaned records found")
+
+            except Exception as e:
+                logger.error(f"File cleanup database error: {e}", exc_info=True)
+                if db:
+                    db.rollback()
+            finally:
+                if db:
+                    db.close()
+                logger.info("File cleanup cycle completed")
+
+        except Exception as e:
+            logger.error(f"File cleanup worker error: {e}", exc_info=True)
+            # Continue running even if there's an error
+            logger.info("File cleanup worker will continue running despite error")
+
 def _whisper_cache_cleanup_worker():
     """
     Periodically checks for and unloads Whisper models that have been inactive.
@@ -855,81 +1041,6 @@ def get_whisper_model(model_size: str, whisper_settings: dict) -> Any:
         except Exception as e:
             logger.error(f"Model '{model_size}' failed to load: {str(e)}", exc_info=True)
             raise RuntimeError(f"Whisper model initialization failed: {e}") from e
-
-def _file_cleanup_worker():
-    """
-    Periodically cleans up old files from upload, processed, and temp directories.
-    Respects retention times configured via environment variables.
-    """
-    while True:
-        # Read settings from environment variables for security
-        cleanup_enabled = os.getenv('FILE_CLEANUP_ENABLED', 'true').lower() in ('true', '1', 't')
-        cleanup_interval = int(os.getenv('FILE_CLEANUP_INTERVAL', '3600'))  # 1 hour default
-
-        if not cleanup_enabled:
-            time.sleep(cleanup_interval)
-            continue
-
-        time.sleep(cleanup_interval)
-
-        try:
-            # Get retention times from environment variables (in seconds)
-            upload_retention = int(os.getenv('UPLOAD_FILE_RETENTION', '86400'))      # 24 hours
-            processed_retention = int(os.getenv('PROCESSED_FILE_RETENTION', '604800')) # 7 days
-            temp_retention = int(os.getenv('TEMP_FILE_RETENTION', '3600'))            # 1 hour
-
-            current_time = time.time()
-            total_cleaned = 0
-
-            # Clean upload directory
-            if PATHS.UPLOADS_DIR.exists():
-                for file_path in PATHS.UPLOADS_DIR.glob("*"):
-                    if file_path.is_file() and file_path.stat().st_mtime < current_time - upload_retention:
-                        try:
-                            file_path.unlink()
-                            logger.debug(f"Cleaned old upload file: {file_path.name}")
-                            total_cleaned += 1
-                        except Exception as e:
-                            logger.warning(f"Failed to clean upload file {file_path}: {e}")
-
-            # Clean processed directory
-            if PATHS.PROCESSED_DIR.exists():
-                for file_path in PATHS.PROCESSED_DIR.glob("*"):
-                    if file_path.is_file() and file_path.stat().st_mtime < current_time - processed_retention:
-                        try:
-                            file_path.unlink()
-                            logger.debug(f"Cleaned old processed file: {file_path.name}")
-                            total_cleaned += 1
-                        except Exception as e:
-                            logger.warning(f"Failed to clean processed file {file_path}: {e}")
-
-            # Clean temp chunk directory
-            if PATHS.CHUNK_TMP_DIR.exists():
-                for file_path in PATHS.CHUNK_TMP_DIR.glob("*"):
-                    if file_path.is_file() and file_path.stat().st_mtime < current_time - temp_retention:
-                        try:
-                            file_path.unlink()
-                            logger.debug(f"Cleaned old temp file: {file_path.name}")
-                            total_cleaned += 1
-                        except Exception as e:
-                            logger.warning(f"Failed to clean temp file {file_path}: {e}")
-
-            # Also clean up empty subdirectories in uploads (like unzipped_* directories)
-            if PATHS.UPLOADS_DIR.exists():
-                for dir_path in PATHS.UPLOADS_DIR.glob("**/"):
-                    if dir_path.is_dir() and not any(dir_path.iterdir()):
-                        try:
-                            dir_path.rmdir()
-                            logger.debug(f"Cleaned empty directory: {dir_path}")
-                        except Exception as e:
-                            logger.warning(f"Failed to clean empty directory {dir_path}: {e}")
-
-            if total_cleaned > 0:
-                logger.info(f"File cleanup completed: removed {total_cleaned} old files")
-
-        except Exception as e:
-            logger.error(f"File cleanup worker error: {e}", exc_info=True)
-            # Continue running even if there's an error
 
 def _get_or_create_model_lock(model_size: str) -> threading.Lock:
     """Thread-safe lock acquisition with minimal global contention"""
@@ -2660,7 +2771,7 @@ async def lifespan(app: FastAPI):
     if _file_cleanup_thread is None:
         _file_cleanup_thread = threading.Thread(target=_file_cleanup_worker, daemon=True)
         _file_cleanup_thread.start()
-        logger.info("File cleanup thread started.")
+        logger.info("File cleanup thread started and will run in background.")
 
     # Download required models on startup
     DOWNLOAD_KOKORO_ON_STARTUP = os.environ.get('DOWNLOAD_KOKORO_ON_STARTUP', 'false').lower() == 'true'
@@ -2932,7 +3043,12 @@ async def upload_chunk(
 ):
     safe_upload_id = secure_filename(upload_id)
     temp_dir = ensure_path_is_safe(PATHS.CHUNK_TMP_DIR / safe_upload_id, [PATHS.CHUNK_TMP_DIR])
-    temp_dir.mkdir(exist_ok=True)
+
+    # Ensure the base chunk tmp directory exists
+    PATHS.CHUNK_TMP_DIR.mkdir(exist_ok=True, parents=True)
+
+    # Create the upload-specific temp directory
+    temp_dir.mkdir(exist_ok=True, parents=True)
     chunk_path = temp_dir / f"{chunk_number}.chunk"
 
     def save_chunk_sync():

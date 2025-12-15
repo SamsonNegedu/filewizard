@@ -17,10 +17,10 @@ services:
       - SESSION_BASED_SCOPING=True # set to True to enable session-based job scoping
       # File cleanup (optional - automatically removes old files)
       - FILE_CLEANUP_ENABLED=true
-      - FILE_CLEANUP_INTERVAL=3600 # Check every hour
-      - UPLOAD_FILE_RETENTION=3600 # Keep uploads 24 hours
-      - PROCESSED_FILE_RETENTION=3600 # Keep processed files 7 days
-      - TEMP_FILE_RETENTION=3600 # Clean temp files after 1 hour
+      - FILE_CLEANUP_INTERVAL=300 # Check every hour
+      - UPLOAD_FILE_RETENTION=300 # Keep uploads 24 hours
+      - PROCESSED_FILE_RETENTION=300 # Keep processed files 7 days
+      - TEMP_FILE_RETENTION=300 # Clean temp files after 1 hour
       #- TRANSCRIPTION_DEVICE=cpu  # change to 'cuda' if GPU available
       #- TRANSCRIPTION_COMPUTE_TYPE=int8 # change to 'float16' or 'int8_float16' if GPU available
       #- TRANSCRIPTION_DEVICE_INDEX=0 # change if multiple GPUs available
