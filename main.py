@@ -4145,25 +4145,38 @@ async def download_zip_batch(job_id: str, request: Request, db: Session = Depend
     })
 
 @app.get("/api/v1/supported-formats/{file_extension}")
-async def get_supported_formats_for_file_type(file_extension: str, user: dict = Depends(require_user)):
+async def get_supported_formats_for_file_type(request: Request, file_extension: str):
     """
     Get supported output formats for a given file extension.
     The file_extension should include the dot (e.g., '.pdf', '.docx').
     """
+    # Handle authentication based on mode
+    if SESSION_BASED_SCOPING:
+        session_id = get_session_id_from_request(request)
+        if not session_id or not validate_session_id(session_id):
+            raise HTTPException(status_code=401, detail="Valid session required")
+    else:
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
     # Validate file extension format
     if not file_extension.startswith('.'):
         file_extension = '.' + file_extension
-    
+    # Ensure it starts with exactly one dot
+    elif file_extension.startswith('..'):
+        file_extension = file_extension[1:]  # Remove extra dot
+
     file_extension = file_extension.lower()
     conversion_tools = APP_CONFIG.get("conversion_tools", {})
-    
+
     # Find tools that support this input extension
     supported_formats = []
     for tool_name, tool_config in conversion_tools.items():
         supported_inputs = tool_config.get("supported_input", [])
         # Convert supported inputs to lowercase for comparison
         supported_inputs_lower = [ext.lower() for ext in supported_inputs]
-        
+
         if file_extension in supported_inputs_lower:
             # Add all available formats for this tool
             for format_key, format_label in tool_config.get("formats", {}).items():
@@ -4174,7 +4187,7 @@ async def get_supported_formats_for_file_type(file_extension: str, user: dict = 
                     "tool": tool_name,
                     "format": format_key
                 })
-    
+
     return {"formats": supported_formats}
 
 

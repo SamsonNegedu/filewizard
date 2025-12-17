@@ -214,7 +214,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const needsSessionId = typeof originalUrl === 'string' &&
             (originalUrl.includes('/jobs') || originalUrl.includes('/convert') ||
              originalUrl.includes('/ocr') || originalUrl.includes('/transcribe') ||
-             originalUrl.includes('/upload'));
+             originalUrl.includes('/upload') || originalUrl.includes('/api/'));
 
         if (typeof url === 'string' && url.startsWith('/')) {
             url = apiUrl(url);
@@ -643,9 +643,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function showActionDialog() {
         dialogFileCount.textContent = stagedFiles.length;
-        
+
         if (stagedFiles.length === 1) {
-            // If only one file is staged, update the format dropdown based on that file
+            // If only one file is staged, fetch formats and then show dialog
             updateFormatsForFile(stagedFiles[0]).then(() => {
                 // Initialize the dialog choices after updating formats
                 if (dialogConversionChoices) dialogConversionChoices.destroy();
@@ -653,6 +653,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (dialogTtsChoices) dialogTtsChoices.destroy();
                 dialogTtsChoices = new Choices(dialogTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...' });
                 dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
+
+                // Now populate the dialog choices with the fetched formats
+                populateDialogConversionChoices();
+
                 dialogInitialView.style.display = 'grid';
                 dialogConvertView.style.display = 'none';
                 dialogTtsView.style.display = 'none';
@@ -768,12 +772,21 @@ function initializeSelectors() {
 }
 
     function getFileExtension(filename) {
-        return '.' + filename.split('.').pop().toLowerCase();
+        // Handle files with multiple dots better - take everything after the first dot
+        // but ensure we have at least one dot
+        const lastDotIndex = filename.lastIndexOf('.');
+        if (lastDotIndex === -1) {
+            return ''; // No extension
+        }
+        return filename.substring(lastDotIndex).toLowerCase();
     }
+
+    // Store the last fetched formats for dialog use
+    let lastFetchedFormats = [];
 
     async function updateFormatsForFile(file) {
         if (!file) return;
-        
+
         const fileExtension = getFileExtension(file.name);
         try {
             const response = await authFetch(`/api/v1/supported-formats/${encodeURIComponent(fileExtension)}`);
@@ -781,15 +794,16 @@ function initializeSelectors() {
                 console.error(`Failed to fetch supported formats for ${fileExtension}:`, response.status);
                 return;
             }
-            
+
             const data = await response.json();
             const formats = data.formats || [];
-            
+            lastFetchedFormats = formats; // Store for dialog use
+
             // Update main output format select
             if (conversionChoices) {
                 // Clear existing choices
                 conversionChoices.clearStore();
-                
+
                 // Group formats by tool name for better UI
                 const groupedFormats = formats.reduce((acc, format) => {
                     if (!acc[format.tool]) {
@@ -804,48 +818,46 @@ function initializeSelectors() {
                     });
                     return acc;
                 }, {});
-                
+
                 // Convert grouped formats to choices array
                 const choicesArray = Object.keys(groupedFormats).map(toolKey => ({
                     label: groupedFormats[toolKey].label,
                     choices: groupedFormats[toolKey].choices
                 }));
-                
+
                 conversionChoices.setChoices(choicesArray, 'value', 'label', true);
             }
-            
-            // Update dialog output format select
-            if (dialogConversionChoices) {
-                // Clear existing choices
-                dialogConversionChoices.clearStore();
-                
-                // Group formats by tool name for better UI
-                const dialogGroupedFormats = formats.reduce((acc, format) => {
-                    if (!acc[format.tool]) {
-                        acc[format.tool] = {
-                            label: window.APP_CONFIG.conversionTools[format.tool]?.name || format.tool,
-                            choices: []
-                        };
-                    }
-                    acc[format.tool].choices.push({
-                        value: format.value,
-                        label: format.label
-                    });
-                    return acc;
-                }, {});
-                
-                // Convert grouped formats to choices array
-                const dialogChoicesArray = Object.keys(dialogGroupedFormats).map(toolKey => ({
-                    label: dialogGroupedFormats[toolKey].label,
-                    choices: dialogGroupedFormats[toolKey].choices
-                }));
-                
-                dialogConversionChoices.setChoices(dialogChoicesArray, 'value', 'label', true);
-            }
-            
+
         } catch (error) {
             console.error(`Error fetching supported formats for ${fileExtension}:`, error);
         }
+    }
+
+    function populateDialogConversionChoices() {
+        if (!dialogConversionChoices || lastFetchedFormats.length === 0) return;
+
+        // Group formats by tool name for better UI
+        const dialogGroupedFormats = lastFetchedFormats.reduce((acc, format) => {
+            if (!acc[format.tool]) {
+                acc[format.tool] = {
+                    label: window.APP_CONFIG.conversionTools[format.tool]?.name || format.tool,
+                    choices: []
+                };
+            }
+            acc[format.tool].choices.push({
+                value: format.value,
+                label: format.label
+            });
+            return acc;
+        }, {});
+
+        // Convert grouped formats to choices array
+        const dialogChoicesArray = Object.keys(dialogGroupedFormats).map(toolKey => ({
+            label: dialogGroupedFormats[toolKey].label,
+            choices: dialogGroupedFormats[toolKey].choices
+        }));
+
+        dialogConversionChoices.setChoices(dialogChoicesArray, 'value', 'label', true);
     }
 
     function updateFileName(input, nameDisplay) {
