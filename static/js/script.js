@@ -3,6 +3,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunks
     const API_BASE = (window.APP_CONFIG && window.APP_CONFIG.api_base) ? window.APP_CONFIG.api_base.replace(/\/$/, '') : '';
 
+    // --- Initialize Session ID Early ---
+    console.log('[Session] Initializing session on page load...');
+    try {
+        const sessionId = getSessionId();
+        console.log(`[Session] Page load session_id: ${sessionId}`);
+    } catch (error) {
+        console.error('[Session] Failed to initialize session on page load:', error);
+    }
+
     // --- User Locale ---
     const USER_LOCALE = navigator.language || 'en-US';
     const USER_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -74,13 +83,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Session Management ---
     function generateSessionId() {
-        // Generate a URL-safe base64 string (43 characters)
-        const array = new Uint8Array(32);
-        crypto.getRandomValues(array);
-        return btoa(String.fromCharCode(...array))
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_')
-            .replace(/=/g, '');
+        try {
+            // Generate a URL-safe base64 string (43 characters)
+            const array = new Uint8Array(32);
+            crypto.getRandomValues(array);
+            const sessionId = btoa(String.fromCharCode(...array))
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=/g, '');
+            console.log(`[Session] Generated session ID: ${sessionId}`);
+            return sessionId;
+        } catch (error) {
+            console.error(`[Session] Failed to generate session ID:`, error);
+            // Fallback to a simple random string
+            const fallback = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
+            console.log(`[Session] Using fallback session ID: ${fallback}`);
+            return fallback;
+        }
     }
 
     function isStorageAvailable(storage) {
@@ -104,7 +123,10 @@ document.addEventListener('DOMContentLoaded', () => {
     function setCookie(name, value, days = 365) {
         const expires = new Date();
         expires.setTime(expires.getTime() + days * 24 * 60 * 60 * 1000);
-        document.cookie = `${name}=${value};expires=${expires.toUTCString()};path=/;SameSite=Lax`;
+        // Use SameSite=None for cross-domain access, with Secure flag
+        const isSecure = window.location.protocol === 'https:';
+        const sameSite = isSecure ? 'SameSite=None;Secure' : 'SameSite=Lax';
+        document.cookie = `${name}=${value};expires=${expires.toUTCString()};path=/;${sameSite}`;
     }
 
     function getSessionId() {
@@ -119,7 +141,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Try to get existing session ID from available storage
         for (const option of storageOptions) {
-            if (!option.available) continue;
+            if (!option.available) {
+                console.log(`[Session] ${option.name} not available`);
+                continue;
+            }
 
             try {
                 let sessionId = null;
@@ -135,6 +160,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (sessionId) {
                     console.log(`[Session] Found existing session_id in ${option.name}: ${sessionId}`);
                     return sessionId;
+                } else {
+                    console.log(`[Session] No session_id found in ${option.name}`);
                 }
             } catch (error) {
                 console.warn(`[Session] Failed to read from ${option.name}:`, error);
@@ -147,19 +174,28 @@ document.addEventListener('DOMContentLoaded', () => {
 
         let storedIn = [];
         for (const option of storageOptions) {
-            if (!option.available) continue;
+            if (!option.available) {
+                console.log(`[Session] Skipping ${option.name} - not available`);
+                continue;
+            }
 
             try {
                 if (option.storage) {
+                    // Web Storage API
                     option.storage.setItem(key, sessionId);
+                    console.log(`[Session] Stored session_id in ${option.name}`);
                 } else {
+                    // Cookies
                     setCookie(key, sessionId);
+                    console.log(`[Session] Stored session_id in cookies`);
                 }
                 storedIn.push(option.name);
             } catch (error) {
                 console.warn(`[Session] Failed to store in ${option.name}:`, error);
             }
         }
+
+        console.log(`[Session] Session ID stored in: ${storedIn.join(', ')}`);
 
         if (storedIn.length === 0) {
             console.warn(`[Session] Could not store session_id in any storage mechanism!`);
@@ -222,7 +258,37 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Add session_id to query parameters for job-related API calls
         if (needsSessionId) {
-            const sessionId = getSessionId();
+            let sessionId = getSessionId();
+            if (!sessionId) {
+                console.error(`[Session] No session_id available for ${originalUrl}, generating new one...`);
+                // Force generation of a new session ID
+                sessionId = generateSessionId();
+                console.log(`[Session] Generated emergency session_id: ${sessionId}`);
+
+                // Try to store it
+                const storageOptions = [
+                    { name: 'localStorage', storage: localStorage, available: isStorageAvailable(localStorage) },
+                    { name: 'sessionStorage', storage: sessionStorage, available: isStorageAvailable(sessionStorage) },
+                    { name: 'cookies', storage: null, available: true }
+                ];
+
+                const key = 'filewizard_session_id';
+                let storedIn = [];
+                for (const option of storageOptions) {
+                    if (!option.available) continue;
+                    try {
+                        if (option.storage) {
+                            option.storage.setItem(key, sessionId);
+                        } else {
+                            setCookie(key, sessionId);
+                        }
+                        storedIn.push(option.name);
+                    } catch (error) {
+                        console.warn(`[Session] Failed to emergency store in ${option.name}:`, error);
+                    }
+                }
+                console.log(`[Session] Emergency stored in: ${storedIn.join(', ')}`);
+            }
             console.log(`[Session] Adding session_id=${sessionId} to ${originalUrl}`);
             const separator = url.includes('?') ? '&' : '?';
             url = `${url}${separator}session_id=${sessionId}`;

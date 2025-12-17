@@ -4153,7 +4153,14 @@ async def get_supported_formats_for_file_type(request: Request, file_extension: 
     # Handle authentication based on mode
     if SESSION_BASED_SCOPING:
         session_id = get_session_id_from_request(request)
+        query_params = dict(request.query_params)
+        headers = dict(request.headers)
+        logger.info(f"Format API auth: session_id={session_id}")
+        logger.info(f"Format API auth: query_params keys={list(query_params.keys())}")
+        logger.info(f"Format API auth: has session_id in query={query_params.get('session_id') is not None}")
+        logger.info(f"Format API auth: valid={validate_session_id(session_id) if session_id else False}")
         if not session_id or not validate_session_id(session_id):
+            logger.warning(f"Session auth failed: session_id={session_id}, query_params={query_params}")
             raise HTTPException(status_code=401, detail="Valid session required")
     else:
         user = get_current_user(request)
