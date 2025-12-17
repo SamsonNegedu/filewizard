@@ -820,18 +820,33 @@ def _file_cleanup_worker():
                                 try:
                                     # Check if file is still referenced by any job
                                     job_ref = db.query(Job).filter(Job.input_filepath == str(file_path)).first()
-                                    if not job_ref or job_ref.status in ['failed', 'cancelled']:
+
+                                    # Clean files for completed, failed, cancelled jobs, or orphaned files
+                                    should_clean = False
+                                    if not job_ref:
+                                        # Orphaned file - clean it
+                                        should_clean = True
+                                        reason = "orphaned (no job record)"
+                                    elif job_ref.status in ['completed', 'failed', 'cancelled']:
+                                        # Final state job - clean the file (input files can be cleaned for completed jobs)
+                                        should_clean = True
+                                        reason = f"job {job_ref.status}"
+                                    elif job_ref.status in ['pending', 'processing']:
+                                        # Still active - don't clean
+                                        reason = f"active job (status: {job_ref.status})"
+                                    else:
+                                        # Unknown status - don't clean but log
+                                        reason = f"unknown job status: {job_ref.status}"
+
+                                    if should_clean:
                                         file_path.unlink()
-                                        logger.info(f"✓ Cleaned old upload file: {file_path.name} (age: {file_age:.1f}s)")
+                                        logger.info(f"✓ Cleaned old upload file: {file_path.name} (age: {file_age:.1f}s, reason: {reason})")
                                         total_cleaned += 1
                                         upload_files_cleaned += 1
 
-                                        # Also clean up the job record if it exists
-                                        if job_ref:
-                                            db.delete(job_ref)
-                                            logger.info(f"✓ Cleaned orphaned job record: {job_ref.id}")
+                                        # For upload files, we don't delete job records here since they might still be referenced by processed files
                                     else:
-                                        logger.info(f"⏭️ Skipping upload file {file_path.name} - still referenced by active job {job_ref.id} (status: {job_ref.status})")
+                                        logger.info(f"⏭️ Skipping upload file {file_path.name} - {reason}")
                                 except Exception as e:
                                     logger.warning(f"✗ Failed to clean upload file {file_path}: {e}")
                     logger.info(f"Upload directory: found {upload_files_found} files, cleaned {upload_files_cleaned}")
@@ -851,20 +866,36 @@ def _file_cleanup_worker():
                                 try:
                                     # Check if file is still referenced by any job
                                     job_ref = db.query(Job).filter(Job.processed_filepath == str(file_path)).first()
-                                    if not job_ref or job_ref.status in ['failed', 'cancelled']:
+
+                                    # Clean files for completed, failed, cancelled jobs, or orphaned files
+                                    should_clean = False
+                                    if not job_ref:
+                                        # Orphaned file - clean it
+                                        should_clean = True
+                                        reason = "orphaned (no job record)"
+                                    elif job_ref.status in ['completed', 'failed', 'cancelled']:
+                                        # Final state job - clean the file and job record
+                                        should_clean = True
+                                        reason = f"job {job_ref.status}"
+                                    elif job_ref.status in ['pending', 'processing']:
+                                        # Still active - don't clean
+                                        reason = f"active job (status: {job_ref.status})"
+                                    else:
+                                        # Unknown status - don't clean but log
+                                        reason = f"unknown job status: {job_ref.status}"
+
+                                    if should_clean:
                                         file_path.unlink()
-                                        logger.info(f"✓ Cleaned old processed file: {file_path.name} (age: {file_age:.1f}s)")
+                                        logger.info(f"✓ Cleaned old processed file: {file_path.name} (age: {file_age:.1f}s, reason: {reason})")
                                         total_cleaned += 1
                                         processed_files_cleaned += 1
 
-                                        # Also clean up the job record if it exists and no input file exists either
+                                        # Clean up the job record for completed/failed/cancelled jobs
                                         if job_ref:
-                                            input_exists = job_ref.input_filepath and Path(job_ref.input_filepath).exists()
-                                            if not input_exists:
-                                                db.delete(job_ref)
-                                                logger.info(f"✓ Cleaned orphaned job record: {job_ref.id}")
+                                            db.delete(job_ref)
+                                            logger.info(f"✓ Cleaned job record: {job_ref.id} ({job_ref.status})")
                                     else:
-                                        logger.info(f"⏭️ Skipping processed file {file_path.name} - still referenced by active job {job_ref.id} (status: {job_ref.status})")
+                                        logger.info(f"⏭️ Skipping processed file {file_path.name} - {reason}")
                                 except Exception as e:
                                     logger.warning(f"✗ Failed to clean processed file {file_path}: {e}")
                     logger.info(f"Processed directory: found {processed_files_found} files, cleaned {processed_files_cleaned}")
